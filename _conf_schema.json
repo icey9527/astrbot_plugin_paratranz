@@ -1,0 +1,167 @@
+{
+  "token": {
+    "description": "ParaTranz API Token",
+    "hint": "个人资料页 -> 设置选项卡里获取，直接填在这里。留空则只能查询公开数据（项目列表、项目信息、文件进度、术语、成员），词条正文一律 401。",
+    "type": "string",
+    "default": ""
+  },
+  "base_url": {
+    "description": "API 基础地址",
+    "hint": "默认 https://paratranz.cn ，自建实例可改。",
+    "type": "string",
+    "default": "https://paratranz.cn"
+  },
+  "use_card": {
+    "description": "尝试发送 QQ JSON 卡片",
+    "hint": "仅在 aiocqhttp 平台生效。发送失败会自动回退成纯文本，不会丢消息。",
+    "type": "bool",
+    "default": true
+  },
+  "menu_image": {
+    "description": "菜单以图片形式发送",
+    "hint": "发 /pt 或 /pt 菜单 时把帮助渲染成图片（纯文本过长在手机上很难看）。渲染失败会自动回退为文本。",
+    "type": "bool",
+    "default": true
+  },
+  "progress_image": {
+    "description": "项目进度以图片发送",
+    "hint": "/pt 项目 时画一张跟官网进度条一样的卡片图（总字数、已翻译/已检查/已审核三条进度条），比纯文本好读。渲染失败或关了会自动退文本。",
+    "type": "bool",
+    "default": true
+  },
+  "list_image": {
+    "description": "列表类输出以图片发送",
+    "hint": "文件排行、术语表、成员、词条列表都画成卡片图（含进度条），比一堆纯文本好读。关掉或渲染失败会退文本。",
+    "type": "bool",
+    "default": true
+  },
+  "menu_buttons": {
+    "description": "菜单使用 QQ 官方按钮",
+    "hint": "仅 qq_official（QQ 开放平台官方机器人）生效，点击按钮等于发送对应指令。协议端（NapCat 等）没有这个能力，会自动退回图片菜单。",
+    "type": "bool",
+    "default": true
+  },
+  "enable_write": {
+    "description": "允许写操作（改词条译文）",
+    "hint": "关闭时客户端拒绝一切非 GET 请求。开启后仍需管理员 + 二次确认码。",
+    "type": "bool",
+    "default": false
+  },
+  "admin_only_write": {
+    "description": "写操作仅限管理员",
+    "hint": "开启后，只有 AstrBot 管理员或 admin_ids 里的人能触发写操作。",
+    "type": "bool",
+    "default": true
+  },
+  "admin_ids": {
+    "description": "额外管理员 QQ 号",
+    "hint": "每行一个或用英文逗号分隔。用于那些不是 Bot 管理员但需要操作项目的人。",
+    "type": "list",
+    "default": []
+  },
+  "allowed_groups": {
+    "description": "允许使用的群号白名单",
+    "hint": "留空表示所有群都响应。填了之后只有这些群能用，私聊不受限制。",
+    "type": "list",
+    "default": []
+  },
+  "confirm_ttl": {
+    "description": "危险操作确认码有效期（秒）",
+    "hint": "确认码一次性使用，且绑定发起人和会话。默认 600 秒（10 分钟），改小更安全，改大省得手慢。",
+    "type": "int",
+    "default": 600,
+    "slider": {
+      "min": 15,
+      "max": 900,
+      "step": 15
+    }
+  },
+  "timeout": {
+    "description": "单次请求超时（秒）",
+    "type": "int",
+    "default": 15
+  },
+  "min_interval": {
+    "description": "两次请求的最小间隔（秒）",
+    "hint": "ParaTranz 全局限流 480 次/分钟，插件内部串行 + 间隔控制，别调太小。",
+    "type": "float",
+    "default": 0.2
+  },
+  "max_concurrency": {
+    "description": "最大并发请求数",
+    "hint": "建议保持 1-2。翻译建议类接口必须串行。",
+    "type": "int",
+    "default": 1,
+    "slider": {
+      "min": 1,
+      "max": 4,
+      "step": 1
+    }
+  },
+  "list_limit": {
+    "description": "列表类默认条数",
+    "hint": "文件排行、术语表、提交记录列表等纯文本/表格输出的默认条数，上限 30。",
+    "type": "int",
+    "default": 10,
+    "slider": {
+      "min": 1,
+      "max": 30,
+      "step": 1
+    }
+  },
+  "member_limit": {
+    "description": "排行榜默认显示人数",
+    "hint": "/pt 成员 一次最多列多少人，默认 20，上限 100。",
+    "type": "int",
+    "default": 20,
+    "slider": {
+      "min": 1,
+      "max": 100,
+      "step": 1
+    }
+  },
+  "strings_limit": {
+    "description": "词条列表默认条数",
+    "hint": "/pt 词条 一次取多少条，默认 20，上限 50。",
+    "type": "int",
+    "default": 20,
+    "slider": {
+      "min": 1,
+      "max": 50,
+      "step": 1
+    }
+  },
+  "diff_preview_max": {
+    "description": "改动汇报图最多显示几条",
+    "hint": "差分图/提交详情图最多画几条，默认 12，上限 30；填 0 表示不画图。",
+    "type": "int",
+    "default": 12,
+    "slider": {
+      "min": 0,
+      "max": 30,
+      "step": 1
+    }
+  },
+  "task_limit": {
+    "description": "任务进度默认显示几个",
+    "hint": "/pt 任务 一次列几个任务，默认 10，上限 20（指令里 /pt 任务 20 可临时覆盖）。",
+    "type": "int",
+    "default": 10,
+    "slider": {
+      "min": 1,
+      "max": 20,
+      "step": 1
+    }
+  },
+  "records_per_page": {
+    "description": "提交记录每页条数",
+    "hint": "/pt 记录 每页几条，默认 10，上限 20。超过一页会给上一页/下一页按钮。",
+    "type": "int",
+    "default": 10,
+    "slider": {
+      "min": 1,
+      "max": 20,
+      "step": 1
+    }
+  }
+}

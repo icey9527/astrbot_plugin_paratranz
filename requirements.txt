@@ -1,0 +1,4 @@
+# AstrBot 核心已自带 aiohttp / Pillow / qq-botpy，
+# 这里只声明下限，避免 pip 把核心依赖升级到不兼容的版本。
+aiohttp>=3.8
+Pillow>=9.0.0
