@@ -69,13 +69,12 @@
 | 文件 | 用途 |
 | --- | --- |
 | `logo.png` | 512×512 正方形，AstrBot 插件列表图标（StarManager 认插件根目录的 `logo.png`） |
-| `logo.svg` | 官方原始 SVG，留档 |
-| `logo_wide.png` | 由 SVG 渲染的横向 wordmark，菜单图顶部用 |
+| `logo_wide.png` | 横向 wordmark，菜单图顶部用 |
 
 ## 第三方资源与许可
 
 - `assets/fa-solid-900.ttf`：Font Awesome Free 7.3.1（https://fontawesome.com），字体按 SIL OFL 1.1 授权，许可证全文见 `assets/LICENSE-FontAwesome.txt`；图标部分按 CC BY 4.0 授权。
-- `logo.png` / `logo_wide.png` / `logo.svg`：ParaTranz 官方标识，仅用于识别本插件所对接的服务。本插件非 ParaTranz 官方出品，未获得官方背书。
+- `logo.png` / `logo_wide.png`：ParaTranz 官方标识，仅用于识别本插件所对接的服务。本插件非 ParaTranz 官方出品，未获得官方背书。
 
 ## 指令
 
@@ -155,15 +154,15 @@
 | `admin_only_write` | `true` | 开启时按上面的权限等级把人分三六九等 |
 | `admin_ids` | `[]` | 额外管理员 QQ 号列表 |
 | `allowed_groups` | `[]` | 群白名单，空表示所有群可用，私聊不受限 |
-| `confirm_ttl` | `600` | 确认码有效期（秒），一次性、绑定发起人和会话 |
+| `confirm_ttl` | `600` | 确认码有效期（秒），一次性；确认必须由有写权限的人完成 |
 | `min_interval` / `max_concurrency` | `0.2` / `1` | 限流保护 |
 
 ## 提交 / 确认 / 撤回
 
 改词条不再是「谁发谁写」，而是走一条提交链：
 
-1. **发起**：任何人在群里都能发起（`/pt 修改`、两个 propose 工具）。插件会先按词条 ID 把旧译文抓下来，生成一条 **10 位以内哈希 ID** 的待确认记录，落盘到 `state.json` 的 `submissions`。
-2. **审核确认**：只有**有写权限的人**（translator / 管理员）能点确认按钮或发 `/pt 确认 <码>`，发起人自己没权限就点不动。确认后才真正调 `PATCH /projects/{id}/strings/{sid}`。
+1. **发起**：任何人在群里都能发起（`/pt 修改`、两个 propose 工具）。插件会先按词条 ID 把旧译文抓下来，生成一条 **8 位哈希 ID** 的待确认记录，按项目落盘到 `submissions/<项目ID>.json`。
+2. **审核确认**：只有**有写权限的人**（translator / 管理员）能点确认按钮或发 `/pt 确认 <码>`，发起人自己没权限就点不动。确认后才真正调 `PUT /projects/{id}/strings/{sid}`。
 3. **记录**：`/pt 记录` 列最近提交和状态（待确认/已写入/已撤回/已取消/已过期），`/pt 记录 <哈希ID>` 看明细（谁发起、谁确认、每条原值→新值）。
 4. **记录查询**：`/pt 记录 [@项目ID] [页码]` 只看**本群绑定的项目**，多项目时先弹项目按钮选一个，再出图（每页 `records_per_page`=10 条，时间 / 条数 / 发起人→确认人 / 哈希），配键盘：每条哈希一颗按钮点开详情图，末行是「上一页 / 下一页」（首页没有上一页、尾页没有下一页）。`/pt 记录 <页码>` 直接翻页。
 5. **撤回**：`/pt 撤回 <哈希ID>`（仅管理员）把那次提交的旧译文全部写回去，状态记 `reverted`。写入成功后管理员会收到一条带「撤回这次提交」按钮的消息，点一下就是撤回。

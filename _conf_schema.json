@@ -43,13 +43,13 @@
   },
   "enable_write": {
     "description": "允许写操作（改词条译文）",
-    "hint": "关闭时客户端拒绝一切非 GET 请求。开启后仍需管理员 + 二次确认码。",
+    "hint": "关闭时客户端拒绝一切非 GET 请求。开启后仍需有写权限的人（管理员或已授权的 translator）+ 二次确认码。",
     "type": "bool",
     "default": false
   },
   "admin_only_write": {
-    "description": "写操作仅限管理员",
-    "hint": "开启后，只有 AstrBot 管理员或 admin_ids 里的人能触发写操作。",
+    "description": "写操作按权限等级控制",
+    "hint": "开启后，管理员和已授权的 translator 可改词条，viewer 只能读，未授权只能看公开数据；关闭后所有人可写（不建议）。",
     "type": "bool",
     "default": true
   },
@@ -67,7 +67,7 @@
   },
   "confirm_ttl": {
     "description": "危险操作确认码有效期（秒）",
-    "hint": "确认码一次性使用，且绑定发起人和会话。默认 600 秒（10 分钟），改小更安全，改大省得手慢。",
+    "hint": "确认码一次性使用，默认 600 秒（10 分钟）；发起谁都能发，确认必须由有写权限的人完成。改小更安全，改大省得手慢。",
     "type": "int",
     "default": 600,
     "slider": {
