@@ -1,7 +1,7 @@
 name: astrbot_plugin_paratranz
 display_name: ParaTranz 翻译项目助手
 desc: 查询 ParaTranz 项目进度、文件、术语与词条；支持群-项目绑定、按 QQ 赋权与可选的词条写入。
-version: v0.18.1
+version: v0.29.4
 author: DeepSeek
 repo: https://github.com/icey9527/astrbot_plugin_paratranz
 astrbot_version: ">=4.11.2"

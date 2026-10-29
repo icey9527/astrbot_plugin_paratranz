@@ -41,6 +41,12 @@
     "type": "bool",
     "default": true
   },
+  "write_with_session": {
+    "description": "写入时使用登录会话（署名）",
+    "hint": "开启后插件会用 Token 换一个会话 cookie 再写词条，记录会进历史并显示你的账号名；关闭或换不到会话时退回 Token 写入，那就记成匿名导入。会话会存在插件数据目录，过期自动重换。",
+    "type": "bool",
+    "default": true
+  },
   "enable_write": {
     "description": "允许写操作（改词条译文）",
     "hint": "关闭时客户端拒绝一切非 GET 请求。开启后仍需有写权限的人（管理员或已授权的 translator）+ 二次确认码。",
@@ -52,6 +58,71 @@
     "hint": "开启后，管理员和已授权的 translator 可改词条，viewer 只能读，未授权只能看公开数据；关闭后所有人可写（不建议）。",
     "type": "bool",
     "default": true
+  },
+  "notify_enable": {
+    "description": "启用站内通知轮询",
+    "hint": "定时拉 ParaTranz 的 /messages，有人评论、@ 你或回复讨论时，交给模型直接在云平台上回。默认关闭。",
+    "type": "bool",
+    "default": false
+  },
+  "notify_interval": {
+    "description": "轮询间隔（秒）",
+    "hint": "拉取不消耗模型额度，60 秒很安全；官方限制每分钟 480 次请求。",
+    "type": "int",
+    "default": 60
+  },
+  "notify_min_count": {
+    "description": "攒够几条通知再一起处理",
+    "hint": "1 = 来一条就回（默认）。往右拖就是攒够 N 条再一次性判断，碎消息多的时候别一条一回刷屏；最多攒 5 分钟也会兜底处理，不会一直吊着。",
+    "type": "int",
+    "default": 1,
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    }
+  },
+  "notify_to_qq": {
+    "description": "处理完顺带在 QQ 说一声",
+    "hint": "打开后模型多一个 tell_qq 工具，觉得该说一声就发到 QQ。默认关。",
+    "type": "bool",
+    "default": false
+  },
+  "notify_qq_target": {
+    "description": "QQ 说给谁听",
+    "hint": "留空=项目绑定的群；群发不出去就不发，不会拿 ParaTranz 用户 ID 当 QQ 号。填群号或 QQ 号可指定。",
+    "type": "string",
+    "default": ""
+  },
+  "read_requires_grant": {
+    "description": "读词条正文需要授权",
+    "hint": "开启时只有管理员和被 /pt grant 授权的人能看词条正文；关闭后谁都能读，写操作仍旧按权限校验。",
+    "type": "bool",
+    "default": true
+  },
+  "owner_ids": {
+    "description": "主人（ParaTranz 账号）",
+    "hint": "逗号分隔，三种形式都认：用户ID（如 64682）、用户名（如 whkl21）、昵称（如 深潜）。填了以后通知里会标「主人」，自动处理也只对主人优先。",
+    "type": "string",
+    "default": ""
+  },
+  "auto_reply_owner": {
+    "description": "自动回复主人",
+    "hint": "开着的话，主人在词条里 @ 机器人会交给当前对话模型判断要不要回。同一词条 10 分钟只处理一次。",
+    "type": "bool",
+    "default": true
+  },
+  "auto_reply_member": {
+    "description": "自动回复项目内成员",
+    "hint": "不是主人、但属于该词条所属项目的成员，也接一句。非项目成员一律不回。",
+    "type": "bool",
+    "default": true
+  },
+  "auto_reply_text": {
+    "description": "回话风格提示",
+    "hint": "喂给模型的语气要求，不是固定话术了。可以写“像同事随口回，别超过50字”。",
+    "type": "text",
+    "default": "像同事随口回，简短，不用敬语。"
   },
   "admin_ids": {
     "description": "额外管理员 QQ 号",
@@ -163,5 +234,11 @@
       "max": 20,
       "step": 1
     }
+  },
+  "auto_stage": {
+    "description": "让模型自己改状态",
+    "hint": "模型判断该标有疑问或退回已翻译时直接改，不动译文。关掉就只回话不改状态。",
+    "type": "bool",
+    "default": true
   }
 }

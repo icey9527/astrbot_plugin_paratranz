@@ -117,6 +117,7 @@
 | `/pt grant <QQ号> [viewer\|translator]` | 给指定人赋权，默认 `translator` |
 | `/pt revoke <QQ号>` | 撤销赋权 |
 | `/pt grants` | 查看授权名单（含谁授权的、什么时候） |
+| `/pt groupname <名字>` | 给本群起个名字，绑定列表和面板里显示 |
 
 ### 写操作
 
@@ -124,6 +125,7 @@
 | --- | --- |
 | `/pt set <词条ID> <译文>` | 改译文，触发二次确认（需 `enable_write` + `translator`） |
 | `/pt ok <确认码>` | 执行待确认操作 |
+| `/pt stage <词条ID> <状态>` | 只改词条状态（标有疑问/已检查），不动原文也不动译文 |
 | `/pt cancel` | 取消自己所有待确认操作 |
 
 ## 权限等级
@@ -156,6 +158,14 @@
 | `allowed_groups` | `[]` | 群白名单，空表示所有群可用，私聊不受限 |
 | `confirm_ttl` | `600` | 确认码有效期（秒），一次性；确认必须由有写权限的人完成 |
 | `min_interval` / `max_concurrency` | `0.2` / `1` | 限流保护 |
+| `notify_enable` | `false` | 站内通知轮询开关：有人评论、@ 你、回复讨论时，交给模型直接在云平台上回 |
+| `notify_interval` | `60` | 轮询间隔（秒） |
+| `notify_to_qq` | `false` | 处理完顺带在 QQ 说一声（给模型多一个 `tell_qq` 工具），走官方 `context.send_message`，不进 QQ 对话流程、不改任何群设置 |
+| `notify_qq_target` | 空 | QQ 说给谁听：留空=项目绑定的群；群发不出去就不发，不会拿 ParaTranz 用户 ID 当 QQ 号。填群号/QQ号可指定 |
+| `notify_min_count` | `1` | 攒够几条通知再一起处理（面板上是 1–10 的拖条）。1=来一条就回；攒满 5 分钟也会兜底处理 |
+| `auto_reply_owner` / `auto_reply_member` | `true` / `true` | 主人 / 项目内成员的消息回不回 |
+| `auto_reply_text` | 空 | 语气风格提示（不是固定话术），模型按这个味道说话 |
+| `auto_stage` | `true` | 允许模型自己标状态（有疑问 / 退回已翻译），永远不碰译文和原文 |
 
 ## 提交 / 确认 / 撤回
 
@@ -229,9 +239,27 @@
 | `paratranz_string_context` | 看某条词条在同一文件里的上下文（前后各 N 条），讨论剧情/人称用 | Token + viewer 以上 |
 | `paratranz_propose_translation` | 发起单条修改（谁都能发起），生成带哈希ID的待确认记录 | Token（确认需有写权限的人） |
 | `paratranz_propose_batch` | 批量发起修改（`edits` 每行 `词条ID|新译文`，或 JSON 数组），上限 100 条，生成一条待确认记录 + 红绿差分图 | Token（确认需有写权限的人） |
+| `paratranz_comments` | 读词条评论，**默认把这条词条下的评论全部翻页拉完**（上限 300），从早到晚排，带 `@用户名` 和回复关系；`string_id` 也支持逗号/空格分隔多个词条（最多 10 个，并发拉） | Token + viewer 以上 |
+| `paratranz_add_comment` | 在某条词条下发评论，可 `@用户名`（ParaTranz 只认 username，昵称点不进去） | Token + 写权限 |
+| `paratranz_dry_run` | 模拟一遍自动回复：给一句话，看模型会怎么回、会不会改状态，只读不写，排障用 | Token |
 
 `propose_translation` 只生成确认码，不会直接落库，必须有人回 `/pt 确认 <码>`（手动输入，模型没法自己确认），
 这就是给「AI 改稿」留的安全阀。
+
+## 自动回复与排查
+
+站内通知（词条评论 `string.comment` / `string.mention`、讨论回复 `issue.reply`）靠轮询拉，
+拉到后交给当前对话模型自己判断：要不要回、要不要标状态。同一词条/讨论 10 分钟内只处理一次，避免自己跟自己唠。
+
+- `@` 一律用 **用户名**，不是昵称。ParaTranz 只把 `@username` 渲染成 `/users/<uid>` 的链接，昵称就是一串死字。
+- 通知水位线单独存在 `plugin_data/astrbot_plugin_paratranz/notify_seen.json`，不跟 `state.json` 混。
+  重载插件不会再退回去把历史通知当新的回一遍，也不会漏掉重载期间来的消息。
+- 自动处理走的是一圈小 agent：把 `read_comments` / `reply` / `set_stage` / `do_nothing` 四个工具交给模型，
+  它自己决定看几眼、要不要动手，最多转 6 轮；不是一次 JSON 判断题，也没有写死的「听到什么词就改什么状态」。
+- 改状态必须 `PUT /projects/{id}/strings`（集合路径）带 `{"op":"edit","items":[{"id":..,"stage":..}]}`。
+  写成 `/strings/{sid}` 服务端照样回 200，但那个 200 是假的，状态一点没变。
+- 每次处理都往同目录的 `notify_debug.log` 记一行（拉到几条、来自谁、模型判断、执行结果），
+  出问题直接看这个文件，不用翻宿主日志。文件超过 200KB 自动只留最近 300 行。
 
 ## 数据落盘
 
