@@ -180,10 +180,71 @@ class StateStore:
 
     # ---------------------------------------------------------------- 项目名缓存
 
+    # ---------------------------------------------------------------- 通知水位线
+    def notify_watermark(self) -> int:
+        """上次处理到的通知ID。重载插件不能丢，不然期间来的通知会被当成旧消息吞掉。"""
+        self._load_sync()
+        try:
+            return int(self._data.get("notify_seen") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    async def set_notify_watermark(self, value: int) -> None:
+        def _do() -> None:
+            self._data["notify_seen"] = int(value or 0)
+
+        await self._mutate(_do)
+
+    def platform_id(self) -> str:
+        self._load_sync()
+        return str(self._data.get("platform_id") or "")
+
+    async def set_platform_id(self, platform_id: str) -> None:
+        pid = str(platform_id or "").strip()
+        if not pid:
+            return
+
+        def _do() -> None:
+            self._data["platform_id"] = pid
+
+        await self._mutate(_do)
+
+    def group_name(self, group_id: str) -> str:
+        self._load_sync()
+        info = (self._data.get("group_names") or {}).get(str(group_id)) or {}
+        return str(info.get("name") or "")
+
+    async def set_group_name(self, group_id: str, name: str) -> None:
+        gid, name = str(group_id), str(name or "").strip()
+        if not gid or not name:
+            return
+
+        def _do() -> None:
+            self._data.setdefault("group_names", {})[gid] = {
+                "name": name,
+                "at": datetime.now().isoformat(timespec="seconds"),
+            }
+
+        await self._mutate(_do)
+
+    def all_group_names(self) -> dict[str, str]:
+        self._load_sync()
+        return {
+            gid: str(info.get("name") or "")
+            for gid, info in (self._data.get("group_names") or {}).items()
+        }
+
     def project_name(self, project_id: int) -> str:
         self._load_sync()
         info = self._data["projects"].get(str(project_id)) or {}
         return str(info.get("name") or "")
+
+    def all_project_names(self) -> dict[str, str]:
+        self._load_sync()
+        return {
+            pid: str(info.get("name") or "")
+            for pid, info in (self._data.get("projects") or {}).items()
+        }
 
     async def set_project_name(self, project_id: int, name: str) -> None:
         if not name:

@@ -1,9 +1,27 @@
+"""ParaTranz 翻译助手插件主文件。
+
+【关于拆分：先记在这里，别忘】
+这个文件太大了，命令、渲染编排、LLM 工具全堆在一起。为了安全起见现在不动，
+等有把握时按下面的方式拆，一批搬完编译+冒烟一次，别一口气全搬：
+
+    main.py         只留注册、配置读取、指令分发、生命周期
+    modules/tools.py    全部 @filter.llm_tool 方法（约 900 行，整块搬，用 mixin）
+    modules/commands.py 全部 _cmd_* 子命令（约 1100 行，按主题分几批搬）
+    modules/notify.py   通知轮询（已拆出去，可以当范本）
+    card.py / render.py / permission.py / store.py / paratranz_client.py  保持不动
+
+拆的时候注意：方法里大量 self.xxx，直接搬会断，得用 mixin 类继承进主类，
+或者抽成显式传参的函数。共享常量（STAGE_NAMES、ROLE_CN、BATCH_MAX 等）
+要一起挪到 modules/common.py，让主文件反过来 import，避免循环依赖。
+"""
+
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import json
 import os
+import re
 import secrets
 import time
 from datetime import datetime
@@ -24,6 +42,7 @@ from .card import (
     try_send_card,
     try_send_keyboard_menu,
 )
+from .modules.notify import Notifier, PendingNotice
 from .paratranz_client import ParaTranzClient, ParaTranzError
 from .permission import (
     ROLE_ADMIN,
@@ -43,7 +62,7 @@ from .render import (
     render_table_card,
     render_task_card,
 )
-from .store import ROLES, StateStore
+from .store import StateStore
 
 STAGE_NAMES = {
     0: "未翻译",
@@ -85,11 +104,11 @@ AVATAR_TTL = 7 * 86400
 MEMBER_LIMIT_DEFAULT = 20
 MEMBER_LIMIT_MAX = 100
 STRINGS_LIMIT_DEFAULT = 20
-STRINGS_LIMIT_MAX = 50
-BATCH_MAX = 100
+STRINGS_LIMIT_MAX = 800
+BATCH_MAX = 800
 TEMP_IMAGE_TTL = 60
 PENDING_TTL = 3 * 86400
-PLUGIN_VERSION = "0.18.1"
+PLUGIN_VERSION = "0.29.4"
 CONFIRM_TTL_DEFAULT = 600
 CACHE_TTL = 3 * 86400
 
@@ -109,6 +128,10 @@ CN_ACTIONS = {
     "绑定": "bind",
     "解绑": "unbind",
     "绑定列表": "binds",
+    "状态": "stage",
+    "标记": "stage",
+    "群名": "groupname",
+    "群名称": "groupname",
     "授权": "grant",
     "撤销": "revoke",
     "名单": "grants",
@@ -200,7 +223,7 @@ def _fmt_progress(files: list[dict]) -> str:
     "astrbot_plugin_paratranz",
     "DeepSeek",
     "ParaTranz 翻译项目查询插件",
-    "0.18.1",
+    "0.29.4",
 )
 class ParaTranzPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -218,6 +241,11 @@ class ParaTranzPlugin(Star):
             ),
         )
         self.enable_write = bool(self.config.get("enable_write", False))
+        self._error_seen: dict[str, float] = {}
+        self._group_name_try: dict[str, float] = {}
+        self._members_cache: dict[int, tuple[float, set[int]]] = {}
+        # 自己的 ParaTranz uid：不让人填，从登录会话或站内通知里自己学
+        self._self_uid: int = 0
         self.use_card = bool(self.config.get("use_card", True))
         self.menu_image = bool(self.config.get("menu_image", True))
         self.task_limit = max(1, min(int(self.config.get("task_limit", 10) or 10), 20))
@@ -245,6 +273,8 @@ class ParaTranzPlugin(Star):
         self._menu_cache_at: dict[str, float] = {}
         self.store = StateStore()
         self.permission = Permission(self.config, self.store)
+        self.notify_platform = self._clean_platform(self.store.platform_id())
+        self.notifier = Notifier(self)
         self.confirm_ttl = max(
             15,
             int(
@@ -262,9 +292,27 @@ class ParaTranzPlugin(Star):
             timeout=float(self.config.get("timeout", 15) or 15),
             min_interval=float(self.config.get("min_interval", 0.2) or 0.0),
             max_concurrency=int(self.config.get("max_concurrency", 1) or 1),
+            session_path=os.path.join(self.store.dir, "session.json"),
+            write_with_session=bool(self.config.get("write_with_session", True)),
         )
 
     async def initialize(self):
+        await self.notifier.start()
+        if self.client.write_with_session:
+            await self.client.ensure_session()
+            if self.client.session_uid and not self._self_uid:
+                self._self_uid = self.client.session_uid
+        if self.client.has_token and not self._self_uid:
+            # 顺手学一下自己的 uid：通知里的 to 就是它，不额外花什么
+            try:
+                data = await self.client.list_messages(1, 1)
+                rows = data.get("results", []) if isinstance(data, dict) else []
+                to = rows[0].get("to") if rows else None
+                if isinstance(to, int) and to > 0:
+                    self._self_uid = to
+                    logger.info(f"[ParaTranz] 自己的用户ID：{to}")
+            except Exception as exc:  # noqa: BLE001
+                logger.info(f"[ParaTranz] 取自己的用户ID失败：{exc}")
         mode = "Token 已配置" if self.client.has_token else "公开只读模式（无 Token）"
         write_mode = "允许写" if self.enable_write else "禁止写"
         binds = len(self.store.all_binds())
@@ -274,7 +322,112 @@ class ParaTranzPlugin(Star):
             f"已绑定 {binds} 个群 / 已授权 {grants} 人"
         )
 
+    async def project_members(self, pid: int) -> set[int]:
+        """项目成员 uid 集合，缓存 5 分钟，省得每条通知都拉一次。"""
+        now = time.time()
+        hit = self._members_cache.get(int(pid))
+        if hit and now - hit[0] < 300:
+            return hit[1]
+        try:
+            rows = await self.client.list_members(int(pid))
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"[ParaTranz] 拉成员失败：{type(exc).__name__}: {exc}")
+            return hit[1] if hit else set()
+        uids = {int(r.get("uid")) for r in rows if str(r.get("uid") or "").isdigit()}
+        self._members_cache[int(pid)] = (now, uids)
+        return uids
+
+    async def is_project_member(self, pid: int | None, uid: int | None) -> bool:
+        if not pid or not uid:
+            return False
+        return int(uid) in await self.project_members(int(pid))
+
+    def is_owner(self, user: dict | None) -> bool:
+        """判断这个 ParaTranz 用户是不是主人。只认 uid 和用户名，昵称会变还会重。"""
+        keys = str(self.config.get("owner_ids") or "")
+        wanted = {
+            k.strip().lower() for k in keys.replace("，", ",").split(",") if k.strip()
+        }
+        if not wanted or not isinstance(user, dict):
+            return False
+        candidates = {str(user.get("id") or ""), str(user.get("username") or "")}
+        return any(c and c.lower() in wanted for c in candidates)
+
+    @staticmethod
+    def _clean_platform(value: str) -> str:
+        """平台ID必须长得像 default_xxx / qq_official 这种，纯数字是被填错的 uid。"""
+        text = str(value or "").strip()
+        if not text or text.isdigit():
+            return ""
+        return text
+
+    def pick_session(self, group_id: str | None = None) -> str | None:
+        """拼一个可主动发送的会话串。优先指定群，否则用第一个绑定群。"""
+        sessions = self.session_candidates(group_id)
+        return sessions[0] if sessions else None
+
+    def _platform_from_manager(self) -> list[str]:
+        """问 AstrBot 要一份当前活着的平台实例 ID，别自己瞎猜。"""
+        try:
+            insts = self.context.platform_manager.get_insts()
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"[ParaTranz] 取平台实例失败：{type(exc).__name__}: {exc}")
+            return []
+        out: list[str] = []
+        for inst in insts or []:
+            try:
+                meta = inst.meta()
+                pid = str(meta.id or "")
+                if not bool(getattr(meta, "support_proactive_message", True)):
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+            if pid and pid not in ("webchat", "astrbot_webchat"):
+                out.append(pid)
+        return out
+
+    def platform_candidates(self) -> list[str]:
+        """可用的平台 ID：先用手上记住的，再补上 AstrBot 的实例列表。"""
+        out: list[str] = []
+        for pid in [self.notify_platform, *self._platform_from_manager()]:
+            pid = self._clean_platform(str(pid or ""))
+            if pid and pid not in out:
+                out.append(pid)
+        return out
+
+    def session_candidates(self, group_id: str | None = None) -> list[str]:
+        """拼一批可尝试的会话串，推送时按顺序试，成了就记住那个平台。"""
+        binds = self.store.all_binds() or {}
+        # 不知道具体群时只试第一个绑定群，别把通知撒到所有群里去
+        groups = [group_id] if group_id else list(binds.keys())[:1]
+        out: list[str] = []
+        for plat in self.platform_candidates():
+            for gid in groups:
+                out.append(f"{plat}:GroupMessage:{gid}")
+        return out
+
+    async def report_error_once(self, signature: str, text: str) -> bool:
+        """同样的错误 10 分钟内只播一次，避免刷屏。"""
+        now = time.time()
+        last = self._error_seen.get(signature, 0.0)
+        if last and now - last < 600:
+            return False
+        self._error_seen[signature] = now
+        session = self.pick_session()
+        if not session:
+            return False
+        try:
+            from astrbot.api.event import MessageChain
+            from astrbot.api.message_components import Plain
+
+            await self.context.send_message(session, MessageChain([Plain(text)]))
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"[ParaTranz] 主动报错发送失败：{type(exc).__name__}: {exc}")
+            return False
+
     async def terminate(self):
+        await self.notifier.stop()
         await self.client.close()
 
     # ------------------------------------------------------------------ 指令入口
@@ -289,6 +442,16 @@ class ParaTranzPlugin(Star):
         if not self.permission.group_allowed(event):
             yield event.plain_result("这个群不在白名单里，不接活。")
             return
+
+        try:
+            plat = self._clean_platform(str(event.unified_msg_origin).split(":", 1)[0])
+            if plat and plat != self.notify_platform:
+                self.notify_platform = plat
+                await self.store.set_platform_id(plat)
+        except Exception:  # noqa: BLE001
+            pass
+
+        await self._learn_group_name(event)
 
         args = _parse_args(event)
         if not args:
@@ -324,6 +487,8 @@ class ParaTranzPlugin(Star):
             "bind": self._cmd_bind,
             "unbind": self._cmd_unbind,
             "binds": self._cmd_binds,
+            "groupname": self._cmd_groupname,
+            "stage": self._cmd_stage,
             "grant": self._cmd_grant,
             "revoke": self._cmd_revoke,
             "grants": self._cmd_grants,
@@ -881,15 +1046,17 @@ class ParaTranzPlugin(Star):
                 "· /pt 绑定 <项目ID> [群号]　给群加一个项目（可绑多个）",
                 "· /pt 解绑 [项目ID] [群号]　不给项目ID就清空该群",
                 "· /pt 绑定列表　查看所有绑定",
-                "· /pt 授权 <QQ号> [viewer|translator]",
-                "· /pt 撤销 <QQ号>",
+                "· /pt 授权 <@某人 或 QQ号/openid> [viewer|translator]",
+                "· /pt 撤销 <@某人 或 QQ号/openid>",
                 "· /pt 授权列表",
+                "· /pt 群名 <名字>　给本群起个名，绑定列表里显示",
                 "",
                 "【提交与确认】",
                 "· /pt 修改 <词条ID> <译文>　发起一条修改（谁都能发起）",
                 "· /pt 确认 <确认码>　有写权限的人点/发这个才真写入",
                 "· /pt cancel　放弃自己发起的待确认",
                 "· /pt 记录 [页码|哈希ID]　提交记录（每页 10 条，点哈希看详情图）",
+                "· /pt 状态 <词条ID> <状态>　标有疑问/已检查，只改状态，不碰原文和译文",
                 "· /pt 撤回 <哈希ID>　把已写入的改动回滚（管理员）",
                 "",
                 "【说明】",
@@ -1227,6 +1394,10 @@ class ParaTranzPlugin(Star):
         if pids:
             await self._warm_project_names(pids)
         lines = [f"· 你的权限：{role}"]
+        try:
+            lines.append(f"· 你的ID：{event.get_sender_id()}")
+        except Exception:  # noqa: BLE001
+            pass
         if pids:
             lines.append(
                 "· 本群绑定：" + "、".join(self._project_label(p) for p in pids)
@@ -1235,6 +1406,16 @@ class ParaTranzPlugin(Star):
                 lines.append("· 多个项目，查询时用 @项目ID 指定")
         else:
             lines.append("· 本群绑定：未绑定（管理员先 /pt 绑定 <项目ID>）")
+        if self.client.write_with_session:
+            if self.client.session_valid:
+                lines.append(
+                    f"· 写入会话：有效（{self.client.session_name or '?'}"
+                    f" / uid {self.client.session_uid or '?'}）"
+                )
+            else:
+                lines.append("· 写入会话：无效，写入会退回匿名导入")
+        else:
+            lines.append("· 写入会话：已关闭（写入会记为匿名导入）")
         if not self.client.has_token:
             lines.append("· Token：未配置，只能查公开数据")
         else:
@@ -1481,6 +1662,66 @@ class ParaTranzPlugin(Star):
             msg += "\n· 这个群现在没绑项目了，查询会被拒绝"
         return "text", msg
 
+    async def _fetch_group_name(self, event: AstrMessageEvent, gid: str) -> str:
+        """先试事件自带的群对象，再退回适配器的 botpy 客户端问群信息接口。"""
+        try:
+            group = await asyncio.wait_for(event.get_group(gid), timeout=6)
+            name = str(getattr(group, "group_name", "") or "").strip()
+            if name:
+                return name
+        except Exception as exc:  # noqa: BLE001
+            logger.info(
+                f"[ParaTranz] event.get_group 没拿到群名：{type(exc).__name__}: {exc}"
+            )
+
+        try:
+            umo = str(getattr(event, "unified_msg_origin", "") or "")
+            plat_id = umo.split(":", 1)[0]
+            inst = self.context.get_platform_inst(plat_id) if plat_id else None
+            bot = getattr(inst, "client", None) if inst else None
+            api = getattr(bot, "api", None)
+            if api is None or not hasattr(api, "_http"):
+                return ""
+            from botpy.http import Route
+
+            route = Route("GET", "/v2/groups/{group_openid}/info", group_openid=gid)
+            payload = await api._http.request(route)
+            if isinstance(payload, dict):
+                return str(payload.get("group_name") or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"[ParaTranz] 群信息接口失败：{type(exc).__name__}: {exc}")
+        return ""
+
+    async def _learn_group_name(self, event: AstrMessageEvent) -> None:
+        """群里说过话就顺手把群名补上，同一个群 10 分钟最多问一次。"""
+        gid = str(event.get_group_id() or "")
+        if not gid or self.store.group_name(gid):
+            return
+        now = time.time()
+        if now - self._group_name_try.get(gid, 0.0) < 600:
+            return
+        self._group_name_try[gid] = now
+        name = await self._fetch_group_name(event, gid)
+        if name:
+            await self.store.set_group_name(gid, name)
+            logger.info(f"[ParaTranz] 记下群名：{gid[-6:]} = {name}")
+
+    async def _cmd_groupname(self, event: AstrMessageEvent, rest: list[str]):
+        gid = str(event.get_group_id() or "")
+        if not gid:
+            return "text", "私聊里认不了群，去群里用。"
+        want = " ".join(rest).strip()
+        if want:
+            reason = self.permission.deny_reason(event, need="admin")
+            if reason:
+                return "text", reason
+            await self.store.set_group_name(gid, want)
+            return "text", f"这个群以后就叫「{want}」了。"
+        cur = self.store.group_name(gid)
+        if cur:
+            return "text", f"这个群：{cur}（{gid}）"
+        return "text", f"这个群还没名字，群ID {gid}。用 /pt 群名 <名字> 起一个。"
+
     async def _cmd_binds(self, event: AstrMessageEvent, rest: list[str]):
         binds = self.store.all_binds()
         binds = {gid: pids for gid, pids in binds.items() if pids}
@@ -1488,41 +1729,147 @@ class ParaTranzPlugin(Star):
             return "text", "还没有任何绑定。用 /pt 绑定 <项目ID> 绑一个。"
         lines = [f"共 {len(binds)} 个群、{sum(len(p) for p in binds.values())} 条绑定"]
         for gid, pids in sorted(binds.items()):
+            gname = self.store.group_name(gid)
+            head = f"· {gname}（…{gid[-6:]}）" if gname else f"· 群 {gid}"
             lines.append(
-                f"· 群 {gid} → " + "、".join(self._project_label(pid) for pid in pids)
+                head + " → " + "、".join(self._project_label(pid) for pid in pids)
             )
         return "text", "\n".join(lines)
+
+    _AT_MARKUP = r'<qqbot-at-user\s+id="([^"]+)"\s*/>|<@!?([A-Za-z0-9_\-]{6,})>'
+
+    @classmethod
+    def _at_targets(cls, event: AstrMessageEvent) -> list[str]:
+        """把消息里的 @ 取成 id 列表。
+
+        官方机器人适配器不会把"@别人"转成带 openid 的 At 组件：正文里的标记会被
+        抹掉，At 组件里只塞一个 qq_official 占位，所以三条路都要扫一遍。
+        """
+        out: list[str] = []
+
+        def _add(value) -> None:
+            text = str(value or "").strip()
+            if not text:
+                return
+            if text.lower() in (
+                "all",
+                "-1",
+                "everyone",
+                "qq_official",
+                "unknown_selfid",
+            ):
+                return
+            if text not in out:
+                out.append(text)
+
+        try:
+            chain = event.get_messages()
+        except Exception:  # noqa: BLE001
+            chain = []
+        for seg in chain or []:
+            name = getattr(seg, "type", "") or type(seg).__name__
+            if str(name).lower() != "at":
+                continue
+            for attr in ("qq", "user_id", "uid", "target"):
+                val = getattr(seg, attr, None)
+                if val is None:
+                    continue
+                _add(val)
+                break
+
+        try:
+            raw_text = str(event.message_str or "")
+        except Exception:  # noqa: BLE001
+            raw_text = ""
+        if raw_text:
+            for m in re.finditer(cls._AT_MARKUP, raw_text):
+                _add(m.group(1) or m.group(2))
+
+        # 官方机器人：@ 的信息只在原始消息对象里，正文已经被清干净了
+        try:
+            message_obj = getattr(event, "message_obj", None)
+            raw_message = getattr(message_obj, "raw_message", None)
+        except Exception:  # noqa: BLE001
+            raw_message = None
+        for mention in getattr(raw_message, "mentions", None) or []:
+            if isinstance(mention, dict):
+                if mention.get("is_you") is True:
+                    continue
+                _add(mention.get("id"))
+            else:
+                if getattr(mention, "is_you", False) is True:
+                    continue
+                _add(getattr(mention, "id", None))
+
+        # 兜底：msg_elements 里偶尔还留着原始片段
+        for elem in getattr(raw_message, "msg_elements", None) or []:
+            if not isinstance(elem, dict):
+                continue
+            content = elem.get("content")
+            if not isinstance(content, str):
+                continue
+            for m in re.finditer(cls._AT_MARKUP, content):
+                _add(m.group(1) or m.group(2))
+        return out
+
+    @staticmethod
+    def _looks_like_id(text: str) -> bool:
+        """QQ 号是纯数字，官方机器人的 openid 是十六进制/带下划线的长串。"""
+        t = str(text or "").strip()
+        if not t:
+            return False
+        if t.isdigit() and len(t) >= 5:
+            return True
+        return bool(re.fullmatch(r"[A-Za-z0-9_\-]{8,}", t))
 
     async def _cmd_grant(self, event: AstrMessageEvent, rest: list[str]):
         reason = self.permission.deny_reason(event, need="admin")
         if reason:
             return "text", reason
-        if not rest or not rest[0].isdigit():
-            return "text", "用法：/pt grant <QQ号> [viewer|translator]，默认 translator"
-        target = rest[0]
-        role = rest[1].lower() if len(rest) > 1 else ROLE_TRANSLATOR
-        if role not in (ROLE_VIEWER, ROLE_TRANSLATOR):
+
+        role = ROLE_TRANSLATOR
+        args = list(rest or [])
+        if args and args[-1].lower() in (ROLE_VIEWER, ROLE_TRANSLATOR):
+            role = args.pop().lower()
+
+        targets = self._at_targets(event)
+        for arg in args:
+            if self._looks_like_id(arg) and arg not in targets:
+                targets.append(arg)
+
+        if not targets:
             return (
                 "text",
-                f"角色只有 viewer（{ROLES['viewer']}）和 translator（{ROLES['translator']}）。",
+                "用法：/pt grant <@某人 或 QQ号/openid> [viewer|translator]，默认 translator。"
+                "官方机器人 @ 人拿到的是 openid，填 QQ 号对不上；"
+                "也可以让对方发 /pt 我，把「你的ID」那行复制过来。",
             )
-        await self.store.grant(target, role, event.get_sender_id())
+        by = str(event.get_sender_id())
+        for target in targets:
+            await self.store.grant(target, role, by)
         return (
             "text",
-            f"已给 {target} 授权：{ROLE_CN[role]}\n要用写操作还得插件配置里 enable_write 打开。",
+            f"已给 {'、'.join(targets)} 授权：{ROLE_CN[role]}\n"
+            f"要用写操作还得插件配置里 enable_write 打开。",
         )
 
     async def _cmd_revoke(self, event: AstrMessageEvent, rest: list[str]):
         reason = self.permission.deny_reason(event, need="admin")
         if reason:
             return "text", reason
-        if not rest or not rest[0].isdigit():
-            return "text", "用法：/pt revoke <QQ号>"
-        ok = await self.store.revoke(rest[0])
-        return (
-            "text",
-            f"已撤销 {rest[0]} 的授权。" if ok else f"{rest[0]} 本来就没授权。",
-        )
+        targets = self._at_targets(event) or [
+            a for a in (rest or []) if self._looks_like_id(a)
+        ]
+        if not targets:
+            return "text", "用法：/pt revoke <@某人 或 QQ号/openid>"
+        done = [t for t in targets if await self.store.revoke(t)]
+        missing = [t for t in targets if t not in done]
+        lines = []
+        if done:
+            lines.append(f"已撤销 {'、'.join(done)} 的授权。")
+        if missing:
+            lines.append(f"{'、'.join(missing)} 本来就没授权。")
+        return "text", "\n".join(lines)
 
     async def _cmd_grants(self, event: AstrMessageEvent, rest: list[str]):
         grants = self.store.all_grants()
@@ -1598,6 +1945,11 @@ class ParaTranzPlugin(Star):
             "by": str(event.get_sender_id()),
             "by_name": self._sender_name(event),
             "note": note,
+            **(
+                {"submitter": self.notifier.self_uid_text()}
+                if self.notifier.self_uid_text()
+                else {}
+            ),
             "status": "pending",
             "created_at": now,
             "at": datetime.now().isoformat(timespec="seconds"),
@@ -1643,6 +1995,34 @@ class ParaTranzPlugin(Star):
     ) -> tuple[list[int], list[str]]:
         done: list[int] = []
         failed: list[str] = []
+        payload = [
+            {
+                "id": int(it["string_id"]),
+                "translation": str(it.get("new") or ""),
+                "stage": 1,
+            }
+            for it in items
+        ]
+
+        # 多条走批量接口，省请求；一条就老实单发
+        if len(payload) > 1:
+            try:
+                got = await self.client.batch_edit_strings(
+                    pid, payload, allow_write=self.enable_write
+                )
+                ok_ids = {
+                    int(x)
+                    for x in (got or [])
+                    if isinstance(x, (int, str)) and str(x).isdigit()
+                }
+                done = [i for i in ok_ids]
+                failed = [str(p["id"]) for p in payload if int(p["id"]) not in ok_ids]
+                if done:
+                    return done, failed
+                logger.warning("[ParaTranz] 批量写入没返回 id，改用逐条")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[ParaTranz] 批量写入失败，改用逐条：{exc}")
+
         for it in items:
             try:
                 await self.client.update_string(
@@ -1684,6 +2064,50 @@ class ParaTranzPlugin(Star):
         sid, translation = int(rest[0]), " ".join(rest[1:])
         await self._propose(event, pid, [(sid, translation)])
         return "sent", ""
+
+    async def _cmd_stage(self, event: AstrMessageEvent, rest: list[str]):
+        """改词条状态（标有疑问、标已检查等），只动状态，不碰原文和译文。"""
+        if not self.client.has_token:
+            return "text", "改状态要 Token。"
+        reason = self.permission.deny_reason(event, need="write")
+        if reason:
+            return "text", reason
+        pids = self.store.binds_of(event.get_group_id())
+        if rest and rest[0].startswith("@") and rest[0][1:].isdigit():
+            pid = int(rest[0][1:])
+            rest = rest[1:]
+        elif len(pids) == 1:
+            pid = pids[0]
+        elif not pids:
+            return "text", "本群没绑定项目，管理员先 /pt 绑定 <项目ID>"
+        else:
+            return "text", "本群绑了多个项目，用 /pt 状态 @项目ID <词条ID> <状态> 指定"
+        if len(rest) < 2:
+            return (
+                "text",
+                "用法：/pt 状态 <词条ID> <状态>，状态可写 有疑问 / 已翻译 / 已检查",
+            )
+        sid_text, stage_text = rest[0], rest[-1].strip()
+        if not sid_text.isdigit():
+            return "text", "词条ID得是数字。"
+        stage = (
+            int(stage_text)
+            if stage_text.lstrip("-").isdigit()
+            else STAGE_ALIASES.get(stage_text)
+        )
+        if stage is None:
+            return "text", f"状态不认识：{stage_text}。可用：" + "、".join(
+                STAGE_ALIASES
+            )
+        if stage == 5:
+            return "text", "标「已审核」要校对权限，这个自己去网页点，别让我代劳。"
+        try:
+            await self.client.set_string_stage(
+                pid, int(sid_text), int(stage), allow_write=self.enable_write
+            )
+        except ParaTranzError as exc:
+            return "text", f"改状态失败：{exc.message}"
+        return "text", f"词条 {sid_text} 已标成「{STAGE_NAMES.get(stage, stage)}」。"
 
     async def _cmd_ok(self, event: AstrMessageEvent, rest: list[str]):
         if not rest or not rest[0].isdigit():
@@ -1957,8 +2381,9 @@ class ParaTranzPlugin(Star):
             fallback.append(
                 f"· {_fmt_time(r.get('approved_at') or r.get('at') or '')}　"
                 f"{len(r.get('items') or [])} 条　{state}　"
-                f"{r.get('by_name') or r.get('by')} → "
-                f"{r.get('approver_name') or r.get('approver') or '未确认'}　#{r.get('hash')}"
+                f"{r.get('by_name') or r.get('by')}"
+                + (f"（提交者 {r['submitter']}）" if r.get("submitter") else "")
+                + f" → {r.get('approver_name') or r.get('approver') or '未确认'}　#{r.get('hash')}"
             )
         fallback.append("看详细图：/pt 记录 <哈希ID>　翻页：/pt 记录 @项目ID <页码>")
         text = "\n".join(fallback)
@@ -2135,6 +2560,758 @@ class ParaTranzPlugin(Star):
                 f"[{s.get('id')}] 状态 {STAGE_NAMES.get(s.get('stage'), s.get('stage'))}\n"
                 f"原文：{(s.get('original') or '').strip()[:200]}\n"
                 f"译文：{(s.get('translation') or '').strip()[:200]}"
+            )
+        return "\n\n".join(out)
+
+    @filter.llm_tool(name="paratranz_notifications")
+    async def tool_notifications(
+        self, event: AstrMessageEvent, only_unread: bool = True, limit: int = 10
+    ):
+        """看自己的站内通知：谁 @ 了你、谁回复了你的评论、谁把你加进了项目。只读，不会标记已读。
+
+        Args:
+            only_unread(bool): 只看未读（status=0），默认 true
+            limit(number): 最多几条，默认 10，最多 30
+        """
+        if not self.client.has_token:
+            return "未配置 Token，读不了通知。"
+        try:
+            data = await self.client.list_messages(1, max(1, min(int(limit) * 3, 90)))
+        except ParaTranzError as exc:
+            return f"查询失败：{exc.message}"
+        rows = data.get("results", []) if isinstance(data, dict) else (data or [])
+        if only_unread:
+            rows = [r for r in rows if int(r.get("status") or 0) == 0]
+        rows = rows[: max(1, min(int(limit), 30))]
+        if not rows:
+            return "没有" + ("未读" if only_unread else "") + "通知。"
+        names = {
+            "string.mention": "@了你",
+            "string.comment": "评论了词条",
+            "member.add": "把你加进了项目",
+            "issue.comment": "回复了讨论",
+        }
+        out = [f"通知 {len(rows)} 条："]
+        for r in rows:
+            who = (
+                (r.get("fromUser") or {}).get("nickname")
+                or (r.get("fromUser") or {}).get("username")
+                or r.get("from")
+            )
+            kind = names.get(str(r.get("type")), str(r.get("type")))
+            link = r.get("link") or {}
+            where = ""
+            if link.get("project"):
+                where = f"　项目 {link.get('project')}"
+            if link.get("id"):
+                where += f"　词条 {link.get('id')}"
+            content = r.get("content")
+            if isinstance(content, dict):
+                content = content.get("text") or ""
+            out.append(
+                f"· {who} {kind}{where}　{r.get('createdAt')}\n"
+                f"  {str(content or '').strip()[:80]}"
+            )
+        return "\n".join(out)
+
+    @filter.llm_tool(name="paratranz_comments")
+    async def tool_comments(
+        self, event: AstrMessageEvent, string_id: str, limit: int = 0
+    ):
+        """读词条下的全部评论（注释），校对时看别人留的意见用。默认整条词条的评论一次全拿出来。
+
+        Args:
+            string_id(string): 一个词条ID，或者多个用逗号/空格分开，比如 "1080209941,1080209940"
+            limit(number): 最多每条显示几条，0 表示全部（默认 0，上限 300）
+        """
+        if not self.client.has_token:
+            return "未配置 Token，读不了评论。"
+        ids = [int(x) for x in str(string_id).replace(",", " ").split() if x.isdigit()]
+        if not ids:
+            return "词条ID得是数字，多个用逗号分开。"
+        ids = ids[:10]
+        cap = 300 if not limit or int(limit) <= 0 else max(1, min(int(limit), 300))
+
+        async def one(sid: int):
+            try:
+                rows = await self.client.list_all_comments(sid, "text", cap)
+            except ParaTranzError as exc:
+                return sid, None, exc.message
+            return sid, rows, ""
+
+        results = await asyncio.gather(*[one(i) for i in ids])
+        blocks: list[str] = []
+        for sid, rows, err in results:
+            if err:
+                blocks.append(f"词条 {sid}：读取失败（{err}）")
+                continue
+            if not rows:
+                blocks.append(f"词条 {sid}：还没有评论")
+                continue
+            blocks.append(self._format_comments(sid, rows))
+        return "\n\n".join(blocks)
+
+    @staticmethod
+    def _format_comments(sid: int, rows: list[dict]) -> str:
+        """评论块：按时间老到新，带 #ID 和回复关系，方便顺着对话看。"""
+        by_id = {int(r.get("id") or 0): r for r in rows}
+        lines = [f"词条 {sid} 的评论共 {len(rows)} 条（从早到晚）："]
+        for r in rows:
+            user = r.get("user") or {}
+            name = user.get("nickname") or user.get("username") or r.get("uid")
+            uname = user.get("username") or ""
+            who = f"{name}(@{uname})" if uname and uname != name else str(name)
+            quote = ""
+            parent = by_id.get(int(r.get("replyTo") or 0))
+            if parent:
+                p_user = (parent.get("user") or {}).get("nickname") or ""
+                p_text = (
+                    str(parent.get("content") or "").strip().replace("\n", " ")[:24]
+                )
+                quote = f"（回复 {p_user}「{p_text}」）"
+            elif r.get("replyTo"):
+                quote = f"（回复 #{r['replyTo']}）"
+            body = str(r.get("content") or "").strip().replace("\n", "  ")
+            lines.append(
+                f"· #{r.get('id')} {who} {r.get('createdAt')}{quote}\n  {body[:400]}"
+            )
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="paratranz_add_comment")
+    async def tool_add_comment(
+        self,
+        event: AstrMessageEvent,
+        string_id: int,
+        content: str,
+        reply_to: int = 0,
+        mention: str = "",
+    ):
+        """在某条词条下发评论。会以 Token 所属账号的身份发出，需写权限。@人直接传用户名，服务端会渲染成链接。
+
+        Args:
+            string_id(number): 词条ID
+            content(string): 评论内容（markdown）
+            reply_to(number): 回复某条评论时填它的 ID，0 表示新开一条
+            mention(string): 要 @ 的用户名，多个用英文逗号分隔，留空不 @
+        """
+        if not self.client.has_token:
+            return "未配置 Token，发不了评论。"
+        text = str(content or "").strip()
+        names = [
+            n.strip().lstrip("@")
+            for n in str(mention or "").replace("，", ",").split(",")
+            if n.strip().lstrip("@")
+        ]
+        if names:
+            text = (text + " " if text else "") + " ".join(f"@{n}" for n in names) + " "
+        if not text.strip():
+            return "评论内容是空的。"
+        reason = self.permission.deny_reason(event, need="write")
+        if reason:
+            return reason
+        try:
+            data = await self.client.add_comment(
+                int(string_id),
+                text.strip(),
+                "text",
+                int(reply_to) or None,
+                allow_write=self.enable_write,
+            )
+        except ParaTranzError as exc:
+            return f"发评论失败：{exc.message}"
+        if isinstance(data, dict) and data.get("id"):
+            tail = f"，已 @ {'、'.join(names)}" if names else ""
+            return f"已发评论 #{data['id']}（词条 {string_id}）{tail}。"
+        return "发出去了，但没拿到评论 ID。"
+
+    @filter.llm_tool(name="paratranz_delete_comment")
+    async def tool_delete_comment(self, event: AstrMessageEvent, comment_id: int):
+        """删除一条评论。仅管理员可用，删了就没了。
+
+        Args:
+            comment_id(number): 评论ID
+        """
+        if not self.client.has_token:
+            return "未配置 Token。"
+        reason = self.permission.deny_reason(event, need="admin")
+        if reason:
+            return reason
+        try:
+            await self.client.delete_comment(
+                int(comment_id), allow_write=self.enable_write
+            )
+        except ParaTranzError as exc:
+            return f"删除失败：{exc.message}"
+        return f"已删除评论 #{comment_id}。"
+
+    @filter.llm_tool(name="paratranz_suggestions")
+    async def tool_suggestions(
+        self,
+        event: AstrMessageEvent,
+        string_id: int,
+        project: str = "",
+        rate: int = 70,
+    ):
+        """取某条词条的翻译建议（翻译记忆），返回历史项目里相似原文的译文和匹配率，校对时用来参考。高开销接口，别连续狂调。
+
+        Args:
+            string_id(number): 词条ID
+            project(string): 项目ID或@项目ID；留空表示当前群已绑定的项目
+            rate(number): 最低匹配率百分比，默认 70，传 0 表示不过滤
+        """
+        if not self.client.has_token:
+            return "未配置 Token，查不了翻译建议。"
+        reason = self.permission.deny_reason(event, need="read")
+        if reason:
+            return reason
+        try:
+            pid = await self._hint_pid(event, project)
+            rows = await self.client.get_suggestions(
+                pid, int(string_id), rate=max(0, int(rate))
+            )
+        except ParaTranzError as exc:
+            return f"查询失败：{exc.message}"
+        items = rows.get("results", []) if isinstance(rows, dict) else (rows or [])
+        if not items:
+            return "没有匹配到翻译建议。"
+        out = [f"词条 {string_id} 的建议 {len(items)} 条："]
+        for s in items[:8]:
+            match = s.get("matching")
+            match_txt = (
+                f"匹配 {round(match * 100, 1)}%"
+                if isinstance(match, (int, float))
+                else ""
+            )
+            out.append(
+                f"· {match_txt}\n"
+                f"  原文：{(s.get('original') or '').strip()[:120]}\n"
+                f"  译文：{(s.get('translation') or '').strip()[:120]}"
+            )
+        return "\n".join(out)
+
+    @filter.llm_tool(name="paratranz_issues")
+    async def tool_issues(
+        self,
+        event: AstrMessageEvent,
+        project: str = "",
+        issue_id: int = 0,
+        status: int = -1,
+        page: int = 1,
+    ):
+        """看项目讨论：不给 issue_id 就是列表（含主讨论和回复），给了就看那条讨论的详细内容和回复。
+
+        Args:
+            project(string): 项目ID或@项目ID；留空表示当前群已绑定的项目
+            issue_id(number): 讨论ID，0 表示列列表
+            status(number): 按状态筛选，0 讨论中，1 已关闭，-1 不限
+            page(number): 页码，从 1 开始
+        """
+        if not self.client.has_token:
+            return "未配置 Token，看不了讨论。"
+        try:
+            pid = await self._hint_pid(event, project)
+            if int(issue_id) > 0:
+                data = await self.client.get_issue(pid, int(issue_id))
+                return self._fmt_issue_detail(data)
+            data = await self.client.list_issues(
+                pid,
+                status=None if int(status) < 0 else int(status),
+                page=max(1, int(page)),
+                page_size=10,
+            )
+        except ParaTranzError as exc:
+            return f"查询失败：{exc.message}"
+        rows = data.get("results", []) if isinstance(data, dict) else (data or [])
+        if not rows:
+            return "这个项目没有讨论。"
+        total = data.get("rowCount") if isinstance(data, dict) else None
+        out = [f"讨论 {total if total is not None else len(rows)} 条："]
+        for it in rows:
+            parent = it.get("parent")
+            tag = "回复" if parent else "讨论"
+            who = self._tiny_user(it)
+            state = "已关闭" if it.get("status") == 1 else "讨论中"
+            head = (it.get("title") or "").strip() or "（无标题）"
+            body = (it.get("content") or "").strip().replace("\n", " ")[:80]
+            out.append(
+                f"· [{it.get('id')}] {tag} {head}　{who}　{state if not parent else ''}\n  {body}"
+            )
+        return "\n".join(out)
+
+    @staticmethod
+    def _tiny_user(item: dict) -> str:
+        user = item.get("user") or {}
+        if isinstance(user, dict):
+            return str(user.get("username") or item.get("uid") or "?")
+        return str(item.get("uid") or "?")
+
+    def _fmt_issue_detail(self, data: dict) -> str:
+        if not isinstance(data, dict):
+            return "没拿到这条讨论。"
+        lines = [
+            f"[{data.get('id')}] {(data.get('title') or '').strip() or '（无标题）'}"
+            f"　{self._tiny_user(data)}"
+            f"　{'已关闭' if data.get('status') == 1 else '讨论中'}",
+            (data.get("content") or "").strip()[:800] or "（空）",
+        ]
+        replies = data.get("replies") or data.get("children") or []
+        if isinstance(replies, list) and replies:
+            lines.append(f"\n回复 {len(replies)} 条：")
+            for r in replies[:10]:
+                lines.append(
+                    f"· {self._tiny_user(r)}：{(r.get('content') or '').strip()[:200]}"
+                )
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="paratranz_create_issue")
+    async def tool_create_issue(
+        self,
+        event: AstrMessageEvent,
+        title: str,
+        content: str,
+        project: str = "",
+    ):
+        """在项目里发起一条讨论。需要写权限。发出去就公开可见，别乱发。
+
+        Args:
+            title(string): 讨论标题
+            content(string): 讨论内容（markdown），@人直接写 @用户名
+            project(string): 项目ID或@项目ID；留空表示当前群已绑定的项目
+        """
+        if not self.client.has_token:
+            return "未配置 Token，发不了讨论。"
+        if not str(title or "").strip() or not str(content or "").strip():
+            return "标题和内容都要有。"
+        reason = self.permission.deny_reason(event, need="write")
+        if reason:
+            return reason
+        try:
+            pid = await self._hint_pid(event, project)
+            data = await self.client.create_issue(
+                pid,
+                str(title).strip(),
+                str(content).strip(),
+                allow_write=self.enable_write,
+            )
+        except ParaTranzError as exc:
+            return f"发起讨论失败：{exc.message}"
+        if isinstance(data, dict) and data.get("id"):
+            return f"已发起讨论 #{data['id']}：{title}"
+        return "发出去了，但没拿到讨论 ID。"
+
+    @filter.llm_tool(name="paratranz_dry_run")
+    async def tool_dry_run(
+        self,
+        event: AstrMessageEvent,
+        target_id: int,
+        kind: str = "string",
+        text: str = "",
+        project: str = "",
+    ):
+        """预览：拿一句话（或讨论里的一条回复）模拟一遍，看看模型会不会回、会不会改状态。
+        只读不写，用来排查「通知到了但机器人没动作」。
+
+        Args:
+            target_id(number): 词条ID，kind=issue 时是讨论ID
+            kind(string): string 或 issue，默认 string
+            text(string): 假设对方说的话，留空就用「在吗」
+            project(string): 项目ID或@项目ID；留空表示当前群已绑定的项目
+        """
+        if not self.client.has_token:
+            return "未配置 Token。"
+        try:
+            pid = await self._hint_pid(event, project)
+        except ParaTranzError as exc:
+            return f"查询失败：{exc.message}"
+        is_issue = str(kind).lower().startswith("issue")
+        notice = PendingNotice(
+            id=0,
+            type="issue.reply" if is_issue else "string.comment",
+            text=str(text or "在吗"),
+            project=int(pid),
+            string_id=None if is_issue else int(target_id),
+            issue_id=int(target_id) if is_issue else None,
+            username=self._sender_name(event) or "测试",
+            mention="",
+            user_id=int(event.get_sender_id())
+            if str(event.get_sender_id()).isdigit()
+            else None,
+        )
+        try:
+            ctx = await self.notifier._build_context(notice)
+        except Exception as exc:  # noqa: BLE001
+            return f"取上下文失败：{type(exc).__name__}: {exc}"
+        preview = await self.notifier.dry_run(notice)
+        return f"模拟结果：{preview}\n\n上下文：\n{ctx[:800]}"
+
+    @filter.llm_tool(name="paratranz_reply_issue")
+    async def tool_reply_issue(
+        self,
+        event: AstrMessageEvent,
+        issue_id: int,
+        content: str,
+        project: str = "",
+    ):
+        """回复某条讨论。需要写权限。
+
+        Args:
+            issue_id(number): 讨论ID
+            content(string): 回复内容（markdown），@人直接写 @用户名
+            project(string): 项目ID或@项目ID；留空表示当前群已绑定的项目
+        """
+        if not self.client.has_token:
+            return "未配置 Token，回不了讨论。"
+        if not str(content or "").strip():
+            return "回复内容是空的。"
+        reason = self.permission.deny_reason(event, need="write")
+        if reason:
+            return reason
+        try:
+            pid = await self._hint_pid(event, project)
+            data = await self.client.reply_issue(
+                pid, int(issue_id), str(content).strip(), allow_write=self.enable_write
+            )
+        except ParaTranzError as exc:
+            return f"回复失败：{exc.message}"
+        if isinstance(data, dict) and data.get("id"):
+            return f"已回复讨论 #{issue_id}（回复 {data['id']}）。"
+        return "回上去了，但没拿到回复 ID。"
+
+    @filter.llm_tool(name="paratranz_check_notifications")
+    async def tool_check_notifications(
+        self, event: AstrMessageEvent, force: bool = False
+    ):
+        """主动拉一轮站内通知（等于定时任务跑一次），把攒到的提醒内容返回；不会自己发消息，也不会主动推送。
+
+        Args:
+            force(bool): 忽略 batch 模式的时间/条数阈值，把攒着的全拿出来
+        """
+        if not self.client.has_token:
+            return "未配置 Token，读不了通知。"
+        try:
+            await self.notifier.poll_once()
+        except ParaTranzError as exc:
+            return f"拉取失败：{exc.message}"
+        batch = self.notifier.take_all() if force else self.notifier.ready_batch()
+        if not batch:
+            left = self.notifier.pending_count()
+            if left:
+                return f"有 {left} 条提醒攒着，还没到批量阈值（模式 {self.notifier.mode}）。"
+            return "没有新的提醒。"
+        return self.notifier.render_batch(batch)
+
+    @filter.llm_tool(name="paratranz_list_groups")
+    async def tool_list_groups(self, event: AstrMessageEvent):
+        """列出本机器人绑定了项目的群：群ID尾号、平台、各自绑定的项目。用来搞清楚"哪个群是哪个群"。"""
+        binds = self.store.all_binds() or {}
+        if not binds:
+            return "还没有任何群绑定项目。"
+        names = dict(self.store.all_project_names() or {})
+        out = [f"共 {len(binds)} 个群："]
+        for gid, pids in binds.items():
+            seq = pids if isinstance(pids, list) else [pids]
+            labels = []
+            for pid in seq:
+                name = names.get(str(pid)) or names.get(pid)
+                labels.append(f"#{pid} {name}" if name else f"#{pid}")
+            gname = self.store.group_name(gid)
+            head = (
+                f"· {gname}（…{str(gid)[-6:]}）" if gname else f"· 群 …{str(gid)[-6:]}"
+            )
+            out.append(f"{head} [{gid}] → " + ("、".join(labels) or "（空）"))
+        out.append("群名来自官方群信息接口，取不到就用 /pt 群名 <名字> 手动起。")
+        return "\n".join(out)
+
+    @filter.llm_tool(name="paratranz_read_group_chat")
+    async def tool_read_group_chat(
+        self,
+        event: AstrMessageEvent,
+        project: int = 0,
+        group_id: str = "",
+        limit: int = 20,
+    ):
+        """读某个群最近的聊天记录（就是机器人平时看到的那份），用来"水群"前先看上下文。
+
+        Args:
+            project(number): 按项目找群，比如 20916
+            group_id(string): 直接指定群ID
+            limit(number): 取最近几条，默认 20，最多 50
+        """
+        gid = str(group_id or "").strip()
+        if not gid and int(project):
+            for g, pids in (self.store.all_binds() or {}).items():
+                seq = pids if isinstance(pids, list) else [pids]
+                if int(project) in [int(p) for p in seq if str(p).isdigit()]:
+                    gid = g
+                    break
+            if not gid:
+                return f"项目 {project} 没绑定在任何群里。"
+        if not gid:
+            return "得给 project 或 group_id。"
+        sess = self.pick_session(gid)
+        if not sess:
+            return "拼不出会话串（平台还没记住）。"
+        plat_id = sess.split(":", 1)[0]
+        n = max(1, min(int(limit or 20), 50))
+        try:
+            rows = await self.context.get_db().get_platform_message_history(
+                plat_id, sess, page=1, page_size=n
+            )
+        except Exception as exc:  # noqa: BLE001
+            return f"读聊天记录失败：{type(exc).__name__}: {exc}"
+
+        lines: list[str] = []
+        for row in reversed(list(rows or [])):
+            text = self._history_text(getattr(row, "content", "") or "")
+            if not text:
+                continue
+            who = getattr(row, "sender_name", "") or "?"
+            when = str(getattr(row, "created_at", ""))[11:16]
+            lines.append(f"[{when}] {who}: {text}")
+        if not lines:
+            return (
+                "没读到聊天记录。可能这个群还没说过话，或者没开群消息记录"
+                "（provider_ltm_settings.group_message_history_enable）。"
+            )
+        name = self.store.group_name(gid) or f"…{gid[-6:]}"
+        return f"「{name}」最近 {len(lines)} 条：\n" + "\n".join(lines)
+
+    @staticmethod
+    def _history_text(content: str) -> str:
+        """把数据库里存的消息 JSON 拆成一行纯文本。"""
+        try:
+            data = json.loads(content) if isinstance(content, str) else content
+        except Exception:  # noqa: BLE001
+            return str(content)[:120]
+        if not isinstance(data, dict):
+            return ""
+        parts: list[str] = []
+        for comp in data.get("message") or []:
+            if not isinstance(comp, dict):
+                continue
+            ctype = str(comp.get("type") or "")
+            if ctype == "plain":
+                parts.append(str(comp.get("text") or ""))
+            elif ctype == "at":
+                parts.append(f"@{comp.get('name') or comp.get('user_id')}")
+            elif ctype == "image":
+                parts.append("[图片]")
+            elif ctype in ("record", "video", "file"):
+                parts.append(f"[{ctype}]")
+            elif ctype == "face" or ctype == "mface":
+                parts.append("[表情]")
+        return " ".join(p.strip() for p in parts if p and p.strip())[:300]
+
+    @filter.llm_tool(name="paratranz_speak_group")
+    async def tool_speak_group(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        project: int = 0,
+        group_id: str = "",
+    ):
+        """往指定绑定群主动发一条消息。需要管理员权限。按项目找群，或直接给群ID。
+
+        Args:
+            text(string): 要说的话
+            project(number): 按项目找群，比如 20916；绑了多个群时发第一个
+            group_id(string): 直接指定群ID（绑定列表里的那串）
+        """
+        reason = self.permission.deny_reason(event, need="admin")
+        if reason:
+            return reason
+        body = str(text or "").strip()
+        if not body:
+            return "要说什么总得给吧。"
+        gid = str(group_id or "").strip()
+        if not gid and int(project):
+            target = None
+            for g, pids in (self.store.all_binds() or {}).items():
+                seq = pids if isinstance(pids, list) else [pids]
+                if int(project) in [int(p) for p in seq if str(p).isdigit()]:
+                    target = g
+                    break
+            if not target:
+                return f"项目 {project} 没有绑定在任何群里。"
+            gid = target
+        if not gid:
+            return "得告诉我是哪个群：给 project 或 group_id。"
+        session = self.pick_session(gid)
+        if not session:
+            return "拿不到平台会话（还没在群里说过话？先发条指令让我记住平台）。"
+        try:
+            from astrbot.api.event import MessageChain
+            from astrbot.api.message_components import Plain
+
+            await self.context.send_message(session, MessageChain([Plain(body)]))
+        except Exception as exc:  # noqa: BLE001
+            return f"发送失败：{type(exc).__name__}: {exc}"
+        return f"已发到群 …{gid[-6:]}。"
+
+    @filter.llm_tool(name="paratranz_scores")
+    async def tool_scores(
+        self, event: AstrMessageEvent, project: str = "", page: int = 1
+    ):
+        """看项目贡献榜（按翻译/编辑/审核累计的贡献分），用来评价某个译者干了多少活。
+
+        Args:
+            project(string): 项目ID或@项目ID；留空表示当前群已绑定的项目
+            page(number): 页码，从 1 开始
+        """
+        if not self.client.has_token:
+            return "未配置 Token，看不了贡献。"
+        try:
+            pid = await self._hint_pid(event, project)
+            data = await self.client.list_scores(
+                pid, page=max(1, int(page)), page_size=20
+            )
+        except ParaTranzError as exc:
+            return f"查询失败：{exc.message}"
+        rows = data.get("results", []) if isinstance(data, dict) else (data or [])
+        if not rows:
+            return "还没有贡献记录（整包导入的项目通常一条都没有）。"
+        lines = []
+        for i, s in enumerate(rows, 1):
+            lines.append(
+                f"{i}. {self._tiny_user(s)}　贡献 {round(float(s.get('value') or 0), 2)}"
+                f"　基准 {s.get('base')} × 乘数 {s.get('multiplier')}"
+            )
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="paratranz_history")
+    async def tool_history(
+        self,
+        event: AstrMessageEvent,
+        project: str = "",
+        uid: int = 0,
+        tid: int = 0,
+        kind: str = "",
+        page: int = 1,
+    ):
+        """查项目历史记录：可按成员、词条、操作类型筛选。kind 传 comment 就是看评论记录。
+
+        Args:
+            project(string): 项目ID或@项目ID；留空表示当前群已绑定的项目
+            uid(number): 只看这个用户的操作，0 表示不限
+            tid(number): 只看这条词条的操作，0 表示不限
+            kind(string): 操作类型，translate/edit/check/review/term/import/comment，空表示默认词条历史
+            page(number): 页码，从 1 开始
+        """
+        if not self.client.has_token:
+            return "未配置 Token，看不了历史。"
+        try:
+            pid = await self._hint_pid(event, project)
+            data = await self.client.list_history(
+                pid,
+                uid=int(uid) or None,
+                tid=int(tid) or None,
+                kind=str(kind or "").strip() or None,
+                page=max(1, int(page)),
+                page_size=10,
+            )
+        except ParaTranzError as exc:
+            return f"查询失败：{exc.message}"
+        rows = data.get("results", []) if isinstance(data, dict) else (data or [])
+        if not rows:
+            return "没有匹配的历史记录。"
+        total = data.get("rowCount") if isinstance(data, dict) else None
+        out = [f"历史 {total if total is not None else len(rows)} 条："]
+        for r in rows:
+            field = r.get("field") or r.get("type") or ""
+            out.append(
+                f"· [{r.get('tid')}] {self._tiny_user(r)} {field}"
+                f"　{str(r.get('from') or '')[:40]} → {str(r.get('to') or '')[:40]}"
+                f"　{r.get('createdAt') or ''}"
+            )
+        return "\n".join(out)
+
+    @filter.llm_tool(name="paratranz_search_strings")
+    async def tool_search_strings(
+        self,
+        event: AstrMessageEvent,
+        text: str = "",
+        translation: str = "",
+        context: str = "",
+        key: str = "",
+        project: str = "",
+        file_id: int = 0,
+        stage: int = -99,
+        page: int = 1,
+        regex: str = "",
+        regex_negate: bool = False,
+        format: str = "",
+    ):
+        """高级搜索词条：原文、译文、上下文、键值可同时组合（服务端 AND），用来找某句台词出现在哪、谁把某个词译成了什么。需要 Token 和授权。
+
+        Args:
+            text(string): 在原文里搜的关键词，留空不限制
+            translation(string): 在译文里搜的关键词，留空不限制
+            context(string): 在上下文备注里搜的关键词，留空不限制
+            key(string): 按键值搜，比如 000A 这种 uid，留空不限制
+            project(string): 项目ID、@项目ID 或项目名称；留空表示当前群已绑定的项目
+            file_id(number): 只看某个文件的词条，0 表示不限
+            stage(number): 按状态过滤，0未翻译 1已翻译 2有疑问 3已检查 5已审核 9已锁定；-99 表示不限
+            page(number): 页码，从 1 开始
+            regex(string): 正则表达式，在原文里服务端正则匹配。走 ParaTranz 原生 advanced 搜索，不需要本地拉页。
+            regex_negate=true 时不匹配（!~= 操作符）。
+            format(string): 传 ids 时只返回逗号分隔的ID列表，不带原文和状态，省大量token。
+        """
+        if not self.client.has_token:
+            return "未配置 Token，读不了词条正文。"
+        regex_pat = str(regex or "").strip()
+        if not any(
+            str(x or "").strip() for x in (text, translation, context, key, regex_pat)
+        ):
+            return "至少给一个搜索条件：text / translation / context / key / regex。"
+        reason = self.permission.deny_reason(event, need="read")
+        if reason:
+            return reason
+        try:
+            pid = await self._hint_pid(event, project)
+            data = await self.client.list_strings(
+                pid,
+                file_id=int(file_id) or None,
+                stage=None if int(stage) == -99 else int(stage),
+                page=max(1, int(page)),
+                page_size=self.strings_limit,
+                text=str(text or "").strip() or None,
+                translation=str(translation or "").strip() or None,
+                context=str(context or "").strip() or None,
+                key=str(key or "").strip() or None,
+                regex=regex_pat or None,
+                regex_negate=str(regex_negate).lower() in ("true", "1", "yes"),
+            )
+        except ParaTranzError as exc:
+            return f"查询失败：{exc.message}"
+        rows = data.get("results", []) if isinstance(data, dict) else data
+
+        if not rows:
+            return "没有匹配的词条。"
+
+        # format=ids：只返回ID列表，省token
+        if str(format or "").strip().lower() == "ids":
+            ids = [str(r.get("id")) for r in rows if r.get("id")]
+            total = data.get("rowCount") if isinstance(data, dict) else None
+            head = f"共 {total if total is not None else len(ids)} 条，本页 {len(ids)} 个ID："
+            return head + ",".join(ids)
+        total = data.get("rowCount") if isinstance(data, dict) else None
+        cond = "、".join(
+            f"{name}={value}"
+            for name, value in (
+                ("原文", text),
+                ("译文", translation),
+                ("上下文", context),
+                ("键值", key),
+            )
+            if str(value or "").strip()
+        )
+        head = f"命中 {total if total is not None else len(rows)} 条（{cond}），第 {max(1, int(page))} 页："
+        out = [head]
+        for s in rows:
+            out.append(
+                f"[{s.get('id')}] {STAGE_NAMES.get(s.get('stage'), s.get('stage'))}\n"
+                f"原文：{(s.get('original') or '').strip()[:200]}\n"
+                f"译文：{(s.get('translation') or '').strip()[:200] or '（空）'}"
             )
         return "\n\n".join(out)
 
@@ -2391,6 +3568,172 @@ class ParaTranzPlugin(Star):
             return f"查询失败：{exc.message}"
         return await self._propose(event, pid, [(int(string_id), str(translation))])
 
+    @filter.llm_tool(name="paratranz_set_stage")
+    async def tool_set_stage(
+        self,
+        event: AstrMessageEvent,
+        string_id: str = "",
+        stage: str = "",
+        project: str = "",
+        regex: str = "",
+    ):
+        """改词条状态（标有疑问、标已检查、退回已翻译等）。支持三种方式：
+        1. 单条：传 string_id=12345
+        2. 批量：传 string_id=12345,67890,11111（逗号分隔）
+        3. 按正则批量：传 regex=正则表达式，自动搜索匹配的词条并全部改掉，不用回传ID
+        只改状态，不动原文，也不动译文。
+
+        Args:
+            string_id(string): 词条ID，单个如 12345，或多个用逗号分隔如 12345,67890,11111。用 regex 时可留空。
+            stage(string): 目标状态，可写 未翻译/已翻译/有疑问/已检查/已审核/锁定 或数字
+            project(string): 项目ID或@项目ID；留空表示当前群已绑定的项目
+            regex(string): 正则表达式，在原文里服务端正则匹配。传了这个就自动搜索并批量改，不需要 string_id。
+        """
+        if not self.client.has_token:
+            return "未配置 Token，改不了。"
+        reason = self.permission.deny_reason(event, need="write")
+        if reason:
+            return reason
+        text = str(stage).strip()
+        value = int(text) if text.lstrip("-").isdigit() else STAGE_ALIASES.get(text)
+        if value is None:
+            return "状态不认识，可用：" + "、".join(STAGE_ALIASES)
+        name = STAGE_NAMES.get(value, str(value))
+        try:
+            pid = await self._hint_pid(event, project)
+            # 按正则批量：先搜再改，ID 不经过模型
+            regex_pat = str(regex or "").strip()
+            if regex_pat:
+                ids: list[int] = []
+                for pg in range(1, 20):
+                    data = await self.client.list_strings(
+                        pid,
+                        page=pg,
+                        page_size=800,
+                        regex=regex_pat,
+                        regex_negate=False,
+                    )
+                    rows = (
+                        data.get("results", [])
+                        if isinstance(data, dict)
+                        else (data or [])
+                    )
+                    ids.extend(int(r["id"]) for r in rows if r.get("id"))
+                    if len(rows) < 800:
+                        break
+                if not ids:
+                    return f"正则 `{regex_pat}` 没有匹配到任何词条，什么都没改。"
+                await self.client.set_stages_batch(
+                    pid, ids, int(value), allow_write=self.enable_write
+                )
+                return (
+                    f"正则 `{regex_pat}` 匹配到 {len(ids)} 条，已全部标成「{name}」。"
+                )
+            # 按 ID 改：单条或逗号分隔
+            raw_ids = [
+                x.strip()
+                for x in str(string_id).replace("，", ",").split(",")
+                if x.strip()
+            ]
+            ids = [int(x) for x in raw_ids if x.lstrip("-").isdigit()]
+            if not ids:
+                return "没解析到有效词条ID，也没给 regex。"
+            if len(ids) == 1:
+                await self.client.set_string_stage(
+                    pid, ids[0], int(value), allow_write=self.enable_write
+                )
+                return f"词条 {ids[0]} 已标成「{name}」。"
+            await self.client.set_stages_batch(
+                pid, ids, int(value), allow_write=self.enable_write
+            )
+            return f"{len(ids)} 条词条已标成「{name}」。"
+        except ParaTranzError as exc:
+            return f"改状态失败：{exc.message}"
+
+    @filter.llm_tool(name="paratranz_replace_translations")
+    async def tool_replace_translations(
+        self,
+        event: AstrMessageEvent,
+        find: str,
+        replace: str = "",
+        project: str = "",
+        use_regex: bool = False,
+        stage: int = -99,
+    ):
+        """在译文里批量查找替换（类似网页的「替换」功能）。先搜索译文里含 find 的词条，
+        把每条译文里的 find 换成 replace，然后生成差分图加确认按钮；有写权限的人确认后才批量写入。
+        不会立刻写入，走确认流程，安全。
+
+        Args:
+            find(string): 要查找的文本，译文里包含它的词条会被处理
+            replace(string): 替换成什么，留空表示删掉 find
+            project(string): 项目ID或@项目ID；留空表示当前群已绑定的项目
+            use_regex(bool): true 时 find 按正则处理，replace 里可以用 \1 \2 引用捕获组
+            stage(number): 按状态过滤，只处理该状态的词条；-99 表示不限
+        """
+        if not self.client.has_token:
+            return "未配置 Token，改不了。"
+        reason = self.permission.deny_reason(event, need="admin")
+        if reason:
+            return f"{reason}（批量替换只认管理员）"
+        find = str(find or "").strip()
+        if not find:
+            return "find 不能为空，要找什么？"
+        try:
+            pid = await self._hint_pid(event, project)
+            # 找出译文里含 find 的词条
+            if use_regex:
+                data = await self.client.list_strings(
+                    pid,
+                    stage=None if int(stage) == -99 else int(stage),
+                    page=1,
+                    page_size=800,
+                    regex=find,
+                    regex_on="translation",
+                    regex_negate=False,
+                )
+            else:
+                data = await self.client.list_strings(
+                    pid,
+                    stage=None if int(stage) == -99 else int(stage),
+                    page=1,
+                    page_size=800,
+                    translation=find,
+                )
+        except ParaTranzError as exc:
+            return f"查询失败：{exc.message}"
+        rows = data.get("results", []) if isinstance(data, dict) else (data or [])
+        if not rows:
+            return "没找到译文里含这个的词条，什么都没改。"
+        # 逐条算替换结果
+        items: list[tuple[int, str]] = []
+        if use_regex:
+            try:
+                pat = re.compile(find)
+            except re.error as exc:
+                return f"正则写错了：{exc}"
+            for row in rows:
+                tr = str(row.get("translation") or "")
+                if not tr:
+                    continue
+                new = pat.sub(replace, tr)
+                if new != tr:
+                    items.append((int(row["id"]), new))
+        else:
+            for row in rows:
+                tr = str(row.get("translation") or "")
+                if not tr or find not in tr:
+                    continue
+                new = tr.replace(find, replace)
+                if new != tr:
+                    items.append((int(row["id"]), new))
+        if not items:
+            return "搜到了词条，但替换后没有变化，可能译文已经是目标内容了。"
+        if len(items) > BATCH_MAX:
+            return f"一次最多替换 {BATCH_MAX} 条，这次匹配到 {len(items)} 条，条件收窄点再试。"
+        note = f"替换译文：{find} → {replace or '（删除）'}"
+        return await self._propose(event, pid, items, note=note)
+
     @filter.llm_tool(name="paratranz_propose_batch")
     async def tool_propose_batch(
         self, event: AstrMessageEvent, edits: str, project: str = ""
@@ -2404,6 +3747,9 @@ class ParaTranzPlugin(Star):
         """
         if not self.client.has_token:
             return "未配置 Token，读不了原译文也改不了。"
+        reason = self.permission.deny_reason(event, need="admin")
+        if reason:
+            return f"{reason}（批量改动只认管理员）"
         items: list[tuple[int, str]] = []
         text = (edits or "").strip()
         if text.startswith("["):

@@ -27,6 +27,8 @@ class Permission:
             if str(i).strip()
         }
         self.admin_only_write = bool(config.get("admin_only_write", True))
+        # 读词条正文是否需要授权：关掉之后谁都能看，写操作照旧按等级校验
+        self.read_requires_grant = bool(config.get("read_requires_grant", True))
         self.store = store
 
     # ---------------------------------------------------------------- 群
@@ -57,7 +59,9 @@ class Permission:
         return None
 
     def can_read_strings(self, event: AstrMessageEvent) -> bool:
-        """词条正文：管理员 / 已授权的人 / 关闭 admin_only_write 时所有人。"""
+        """词条正文：管理员 / 已授权的人 / 允许公开阅读时所有人。"""
+        if not self.read_requires_grant:
+            return True
         if not self.admin_only_write:
             return True
         return self.role(event) in (ROLE_ADMIN, ROLE_TRANSLATOR, ROLE_VIEWER)

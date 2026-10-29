@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -760,13 +761,13 @@ def _ago(iso: str) -> str:
     if not iso:
         return ""
     try:
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         text = iso.replace("Z", "+00:00")
         dt = datetime.fromisoformat(text)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        delta = (datetime.now(timezone.utc) - dt).total_seconds()
+            dt = dt.replace(tzinfo=UTC)
+        delta = (datetime.now(UTC) - dt).total_seconds()
     except Exception:  # noqa: BLE001
         return ""
     if delta < 300:
